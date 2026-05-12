@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import json
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -140,6 +142,28 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+
+
+def _dump_cuda_graph_annotations() -> None:
+    out_path = os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH", "")
+    if not out_path:
+        return
+    try:
+        from torch.cuda._graph_annotations import get_kernel_annotations
+        annotations = get_kernel_annotations()
+        if not annotations:
+            logger.warning(
+                "cuda_graph_markers: get_kernel_annotations() returned empty; "
+                "ensure pytorch_cuda_graph_markers fork is installed.")
+            return
+        with open(out_path, "w") as f:
+            json.dump({str(k): v for k, v in annotations.items()}, f)
+        logger.info("cuda_graph_markers: wrote %d kernel annotations to %s",
+                    len(annotations), out_path)
+    except ImportError:
+        logger.debug(
+            "cuda_graph_markers: torch.cuda._graph_annotations not available, "
+            "skipping.")
 
 
 class CUDAGraphWrapper:
@@ -335,6 +359,7 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            _dump_cuda_graph_annotations()
 
             compilation_counter.num_cudagraph_captured += 1
 
