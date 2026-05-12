@@ -118,6 +118,9 @@ set(SPINLOOP_COMPILE_FLAGS "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
   list(APPEND SPINLOOP_COMPILE_FLAGS "-mmwaitx")
 endif()
+# spinloop.cpp uses Py_buffer (buffer protocol) which is not in the stable ABI.
+# Undefine Py_LIMITED_API so the full Python C API is available for this target.
+list(APPEND SPINLOOP_COMPILE_FLAGS "-UPy_LIMITED_API")
 define_extension_target(
   spinloop
   DESTINATION vllm
