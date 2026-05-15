@@ -144,6 +144,72 @@ class CUDAGraphOptions:
     weak_ref_output: bool = True
 
 
+def _add_fqn_annotation_hooks(model: torch.nn.Module) -> list:
+    """Register mark_kernels(fqn) forward hooks on every module so that
+    kernels captured inside a CUDA graph are tagged with their FQN."""
+    try:
+        from torch.cuda._graph_annotations import mark_kernels
+    except ImportError:
+        return []
+
+    handles: list = []
+    active_cms: dict[int, Any] = {}
+
+    for name, module in model.named_modules():
+        fqn = f"L.{name}" if name else "L"
+
+        def pre_hook(mod, _input, fqn=fqn):
+            cm = mark_kernels(fqn)
+            active_cms[id(mod)] = cm
+            cm.__enter__()
+
+        def post_hook(mod, _input, _output):
+            cm = active_cms.pop(id(mod), None)
+            if cm is not None:
+                cm.__exit__(None, None, None)
+
+        handles.append(module.register_forward_pre_hook(pre_hook))
+        handles.append(module.register_forward_hook(post_hook))
+
+    return handles
+
+
+def _prepare_cuda_graph_annotations(
+        runnable: Any) -> tuple[bool, list]:
+    """Enable annotation infrastructure and register FQN hooks if possible.
+
+    Returns (annotations_active, hook_handles).
+    """
+    if not os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH", ""):
+        return False, []
+    try:
+        from torch.cuda._graph_annotations import (
+            clear_kernel_annotations, enable_annotations)
+        clear_kernel_annotations()
+        enable_annotations()
+        handles = []
+        if isinstance(runnable, torch.nn.Module):
+            handles = _add_fqn_annotation_hooks(runnable)
+        return True, handles
+    except ImportError:
+        logger.debug(
+            "cuda_graph_markers: torch.cuda._graph_annotations not available, "
+            "skipping.")
+        return False, []
+
+
+def _finalize_cuda_graph_annotations(cudagraph: torch.cuda.CUDAGraph,
+                                     handles: list) -> None:
+    """Remap annotations to the exec graph and remove hooks."""
+    for h in handles:
+        h.remove()
+    try:
+        from torch.cuda._graph_annotations import remap_to_exec_graph
+        remap_to_exec_graph(cudagraph)
+    except ImportError:
+        pass
+
+
 def _dump_cuda_graph_annotations() -> None:
     out_path = os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH", "")
     if not out_path:
@@ -156,6 +222,7 @@ def _dump_cuda_graph_annotations() -> None:
                 "cuda_graph_markers: get_kernel_annotations() returned empty; "
                 "ensure pytorch_cuda_graph_markers fork is installed.")
             return
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
         with open(out_path, "w") as f:
             json.dump({str(k): v for k, v in annotations.items()}, f)
         logger.info("cuda_graph_markers: wrote %d kernel annotations to %s",
@@ -306,6 +373,9 @@ class CUDAGraphWrapper:
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
+            ann_active, ann_hooks = _prepare_cuda_graph_annotations(
+                self.runnable)
+
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
                     # during every model forward for piecewise cudagraph
@@ -346,6 +416,13 @@ class CUDAGraphWrapper:
                     # forks copy_stream, but wait_prefetch only happens in
                     # the next forward pass.
                     get_offloader().join_after_forward()
+                    if ann_active:
+                        try:
+                            from torch.cuda._graph_annotations import (
+                                resolve_pending_annotations)
+                            resolve_pending_annotations()
+                        except ImportError:
+                            pass
                     if self.cudagraph_options.weak_ref_output:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released
@@ -359,6 +436,7 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            _finalize_cuda_graph_annotations(cudagraph, ann_hooks)
             _dump_cuda_graph_annotations()
 
             compilation_counter.num_cudagraph_captured += 1
