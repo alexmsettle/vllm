@@ -182,6 +182,7 @@ def _prepare_cuda_graph_annotations(
     """
     if not os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH", ""):
         return False, []
+    logger.debug("cuda_graph_markers: runnable type = %s", type(runnable))
     try:
         from torch.cuda._graph_annotations import (
             clear_kernel_annotations, enable_annotations)

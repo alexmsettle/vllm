@@ -94,6 +94,9 @@ class TorchCompileWithNoGuardsWrapper:
 
         if isinstance(backend, str) and backend == "inductor":
             options = vllm_config.compilation_config.inductor_compile_config
+            if os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH"):
+                options = dict(options)
+                options["triton.cudagraph_kernel_annotations"] = True
 
         self.first_compile = True
         self.evaluate_guards = (
