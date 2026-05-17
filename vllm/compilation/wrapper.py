@@ -94,9 +94,49 @@ class TorchCompileWithNoGuardsWrapper:
 
         if isinstance(backend, str) and backend == "inductor":
             options = vllm_config.compilation_config.inductor_compile_config
-            if os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH"):
+            ann_path = os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH")
+
+            # Read inductor's view of the option BEFORE we mutate, so we can
+            # tell whether the pytorch fork even has the field defined.
+            try:
+                import torch._inductor.config as ind_cfg
+                pre_val = getattr(ind_cfg.triton,
+                                  "cudagraph_kernel_annotations", "<MISSING>")
+                logger.info(
+                    "cuda_graph_markers[wrapper]: inductor_config.triton."
+                    "cudagraph_kernel_annotations BEFORE patch = %r "
+                    "(if <MISSING>, the pytorch fork is not the one with "
+                    "the FQN feature)", pre_val)
+            except Exception as e:
+                logger.warning(
+                    "cuda_graph_markers[wrapper]: cannot read "
+                    "torch._inductor.config: %s", e)
+
+            if ann_path:
                 options = dict(options)
                 options["triton.cudagraph_kernel_annotations"] = True
+                logger.info(
+                    "cuda_graph_markers[wrapper]: inductor backend + "
+                    "VLLM_CUDA_GRAPH_ANNOTATIONS_PATH=%s -> set "
+                    "options['triton.cudagraph_kernel_annotations']=True "
+                    "(prefix=%r, is_encoder=%s)",
+                    ann_path, compile_prefix, is_encoder)
+                logger.info(
+                    "cuda_graph_markers[wrapper]: inductor_compile_config "
+                    "key set; sanity check: options['triton.cudagraph_"
+                    "kernel_annotations']=%r",
+                    options.get("triton.cudagraph_kernel_annotations"))
+            else:
+                logger.info(
+                    "cuda_graph_markers[wrapper]: inductor backend but "
+                    "VLLM_CUDA_GRAPH_ANNOTATIONS_PATH not set; "
+                    "triton.cudagraph_kernel_annotations NOT applied "
+                    "(prefix=%r).", compile_prefix)
+        else:
+            logger.info(
+                "cuda_graph_markers[wrapper]: backend=%r is not 'inductor'; "
+                "FQN annotation compile option NOT applied (prefix=%r).",
+                backend, compile_prefix)
 
         self.first_compile = True
         self.evaluate_guards = (

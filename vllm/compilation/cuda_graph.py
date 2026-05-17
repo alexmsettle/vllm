@@ -144,34 +144,60 @@ class CUDAGraphOptions:
     weak_ref_output: bool = True
 
 
-def _add_fqn_annotation_hooks(model: torch.nn.Module) -> list:
-    """Register mark_kernels(fqn) forward hooks on every module so that
-    kernels captured inside a CUDA graph are tagged with their FQN."""
+_prereqs_logged: bool = False
+
+
+def _log_prereqs_once() -> None:
+    """Validate and log prerequisites for FQN annotations.
+
+    Mirrors the skip-conditions in pytorch test_cuda_graph_annotations.py:
+      - cuda.bindings package importable (_HAS_CUDA_BINDINGS)
+      - cudaGraphNodeGetToolsId available (cuda-compat >= 13.1)
+      - _annotations_enabled is True after enable_annotations()
+    Emits once per process to avoid spam.
+    """
+    global _prereqs_logged
+    if _prereqs_logged:
+        return
+    _prereqs_logged = True
+
     try:
-        from torch.cuda._graph_annotations import mark_kernels
-    except ImportError:
-        return []
+        import cuda.bindings.runtime  # noqa: F401
+        logger.info(
+            "cuda_graph_markers[prereq]: cuda.bindings.runtime importable OK")
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[prereq]: cuda.bindings.runtime NOT importable "
+            "(%s); FQN annotations cannot populate. Install cuda-bindings.",
+            e)
+        return
 
-    handles: list = []
-    active_cms: dict[int, Any] = {}
+    try:
+        from torch.cuda._utils import _HAS_CUDA_BINDINGS
+        logger.info(
+            "cuda_graph_markers[prereq]: _HAS_CUDA_BINDINGS=%s",
+            _HAS_CUDA_BINDINGS)
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[prereq]: cannot import _HAS_CUDA_BINDINGS: %s",
+            e)
 
-    for name, module in model.named_modules():
-        fqn = f"L.{name}" if name else "L"
-
-        def pre_hook(mod, _input, fqn=fqn):
-            cm = mark_kernels(fqn)
-            active_cms[id(mod)] = cm
-            cm.__enter__()
-
-        def post_hook(mod, _input, _output):
-            cm = active_cms.pop(id(mod), None)
-            if cm is not None:
-                cm.__exit__(None, None, None)
-
-        handles.append(module.register_forward_pre_hook(pre_hook))
-        handles.append(module.register_forward_hook(post_hook))
-
-    return handles
+    try:
+        from torch.cuda._graph_annotations import _is_tools_id_unavailable
+        unavail = _is_tools_id_unavailable()
+        if unavail:
+            logger.warning(
+                "cuda_graph_markers[prereq]: _is_tools_id_unavailable()=True "
+                "-- cudaGraphNodeGetToolsId missing (need cuda-compat>=13.1). "
+                "mark_kernels() will silently no-op; annotations cannot work.")
+        else:
+            logger.info(
+                "cuda_graph_markers[prereq]: _is_tools_id_unavailable()=False "
+                "(cuda-compat OK)")
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[prereq]: _is_tools_id_unavailable import "
+            "failed: %s", e)
 
 
 def _prepare_cuda_graph_annotations(
@@ -180,35 +206,58 @@ def _prepare_cuda_graph_annotations(
 
     Returns (annotations_active, hook_handles).
     """
-    if not os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH", ""):
+    out_path = os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH", "")
+    if not out_path:
         return False, []
-    logger.debug("cuda_graph_markers: runnable type = %s", type(runnable))
+    _log_prereqs_once()
+    logger.info(
+        "cuda_graph_markers[prepare]: VLLM_CUDA_GRAPH_ANNOTATIONS_PATH=%s, "
+        "runnable type=%s", out_path, type(runnable).__name__)
     try:
-        from torch.cuda._graph_annotations import (
-            clear_kernel_annotations, enable_annotations)
-        clear_kernel_annotations()
-        enable_annotations()
+        from torch.cuda import _graph_annotations as _ga
+        _ga.clear_kernel_annotations()
+        _ga.enable_annotations()
+        logger.info(
+            "cuda_graph_markers[prepare]: enable_annotations() called; "
+            "_annotations_enabled=%s", _ga._annotations_enabled)
         handles = []
         if isinstance(runnable, torch.nn.Module):
-            handles = _add_fqn_annotation_hooks(runnable)
+            handles = _ga.register_fqn_annotation_hooks(runnable)
+            logger.info(
+                "cuda_graph_markers[prepare]: runnable IS nn.Module -> "
+                "register_fqn_annotation_hooks() registered %d hook "
+                "handles (2 per module)", len(handles))
+        else:
+            logger.info(
+                "cuda_graph_markers[prepare]: runnable is NOT nn.Module "
+                "(type=%s); no FQN hooks registered -- relying on "
+                "compile-time triton.cudagraph_kernel_annotations only",
+                type(runnable).__name__)
         return True, handles
-    except ImportError:
-        logger.debug(
-            "cuda_graph_markers: torch.cuda._graph_annotations not available, "
-            "skipping.")
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[prepare]: torch.cuda._graph_annotations "
+            "ImportError: %s; skipping.", e)
         return False, []
 
 
 def _finalize_cuda_graph_annotations(cudagraph: torch.cuda.CUDAGraph,
                                      handles: list) -> None:
     """Remap annotations to the exec graph and remove hooks."""
+    logger.info(
+        "cuda_graph_markers[finalize]: removing %d hook handles",
+        len(handles))
     for h in handles:
         h.remove()
     try:
         from torch.cuda._graph_annotations import remap_to_exec_graph
         remap_to_exec_graph(cudagraph)
-    except ImportError:
-        pass
+        logger.info(
+            "cuda_graph_markers[finalize]: remap_to_exec_graph() OK")
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[finalize]: remap_to_exec_graph "
+            "ImportError: %s", e)
 
 
 def _dump_cuda_graph_annotations() -> None:
@@ -220,18 +269,30 @@ def _dump_cuda_graph_annotations() -> None:
         annotations = get_kernel_annotations()
         if not annotations:
             logger.warning(
-                "cuda_graph_markers: get_kernel_annotations() returned empty; "
-                "ensure pytorch_cuda_graph_markers fork is installed.")
+                "cuda_graph_markers[dump]: get_kernel_annotations() "
+                "returned empty; ensure pytorch_cuda_graph_markers fork "
+                "is installed.")
             return
+        unique = set()
+        for v in annotations.values():
+            if isinstance(v, list):
+                for e in v:
+                    if isinstance(e, dict) and "str" in e:
+                        unique.add(e["str"])
+        sample = sorted(unique)[:5]
+        logger.info(
+            "cuda_graph_markers[dump]: %d annotations, %d unique strings, "
+            "sample=%s", len(annotations), len(unique), sample)
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
         with open(out_path, "w") as f:
             json.dump({str(k): v for k, v in annotations.items()}, f)
-        logger.info("cuda_graph_markers: wrote %d kernel annotations to %s",
-                    len(annotations), out_path)
-    except ImportError:
-        logger.debug(
-            "cuda_graph_markers: torch.cuda._graph_annotations not available, "
-            "skipping.")
+        logger.info(
+            "cuda_graph_markers[dump]: wrote %d kernel annotations to %s",
+            len(annotations), out_path)
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[dump]: torch.cuda._graph_annotations "
+            "ImportError: %s; skipping.", e)
 
 
 class CUDAGraphWrapper:
@@ -422,8 +483,13 @@ class CUDAGraphWrapper:
                             from torch.cuda._graph_annotations import (
                                 resolve_pending_annotations)
                             resolve_pending_annotations()
-                        except ImportError:
-                            pass
+                            logger.info(
+                                "cuda_graph_markers[resolve]: "
+                                "resolve_pending_annotations() OK")
+                        except ImportError as e:
+                            logger.warning(
+                                "cuda_graph_markers[resolve]: "
+                                "ImportError: %s", e)
                     if self.cudagraph_options.weak_ref_output:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released
