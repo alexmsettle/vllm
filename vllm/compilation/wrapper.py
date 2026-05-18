@@ -115,10 +115,19 @@ class TorchCompileWithNoGuardsWrapper:
             vllm_config.compilation_config.inductor_compile_config[
                 "triton.cudagraph_kernel_annotations"
             ] = True
+            # Companion knob: bypass FxGraphCache so structurally identical
+            # pieces (e.g. transformer layers 2..30 in Llama) each recompile
+            # with their own nn_module_stack-derived FQN, instead of all
+            # sharing one cached wrapper with one baked FQN. Cost is paid in
+            # warmup compile time only; no runtime impact.
+            vllm_config.compilation_config.inductor_compile_config[
+                "triton.force_disable_cache_for_kernel_annotations"
+            ] = True
             logger.info(
                 "cuda_graph_markers[wrapper]: torch.compile enabled "
                 "(mode=%s); set compilation_config.inductor_compile_config"
-                "['triton.cudagraph_kernel_annotations']=True "
+                "['triton.cudagraph_kernel_annotations']=True + "
+                "['triton.force_disable_cache_for_kernel_annotations']=True "
                 "(prefix=%r, is_encoder=%s)",
                 mode.name, compile_prefix, is_encoder)
         else:
