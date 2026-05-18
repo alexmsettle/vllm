@@ -87,17 +87,17 @@ class TorchCompileWithNoGuardsWrapper:
         if mode is None:
             raise RuntimeError("Compilation mode cannot be NO_COMPILATION")
 
-        backend = vllm_config.compilation_config.init_backend(
-            vllm_config, prefix=compile_prefix, is_encoder=is_encoder
-        )
-        options = {}
-
-        if isinstance(backend, str) and backend == "inductor":
-            options = vllm_config.compilation_config.inductor_compile_config
-            ann_path = os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH")
-
-            # Read inductor's view of the option BEFORE we mutate, so we can
-            # tell whether the pytorch fork even has the field defined.
+        # Reaching this point implies torch.compile is enabled (mode != None
+        # asserted above). All supported vllm compile modes ultimately call
+        # inductor — either directly when backend=="inductor" (STOCK_TORCH_COMPILE)
+        # or wrapped via VllmBackend (VLLM_COMPILE). VllmBackend deepcopies
+        # compilation_config.inductor_compile_config during its own __init__
+        # (called from init_backend() below), so the FQN annotation flag MUST be
+        # injected into that central dict BEFORE init_backend() runs.  The
+        # string-inductor path also reads the same dict, so a single injection
+        # covers both consumption paths.
+        ann_path = os.environ.get("VLLM_CUDA_GRAPH_ANNOTATIONS_PATH")
+        if ann_path:
             try:
                 import torch._inductor.config as ind_cfg
                 pre_val = getattr(ind_cfg.triton,
@@ -112,31 +112,46 @@ class TorchCompileWithNoGuardsWrapper:
                     "cuda_graph_markers[wrapper]: cannot read "
                     "torch._inductor.config: %s", e)
 
-            if ann_path:
-                options = dict(options)
-                options["triton.cudagraph_kernel_annotations"] = True
-                logger.info(
-                    "cuda_graph_markers[wrapper]: inductor backend + "
-                    "VLLM_CUDA_GRAPH_ANNOTATIONS_PATH=%s -> set "
-                    "options['triton.cudagraph_kernel_annotations']=True "
-                    "(prefix=%r, is_encoder=%s)",
-                    ann_path, compile_prefix, is_encoder)
-                logger.info(
-                    "cuda_graph_markers[wrapper]: inductor_compile_config "
-                    "key set; sanity check: options['triton.cudagraph_"
-                    "kernel_annotations']=%r",
-                    options.get("triton.cudagraph_kernel_annotations"))
-            else:
-                logger.info(
-                    "cuda_graph_markers[wrapper]: inductor backend but "
-                    "VLLM_CUDA_GRAPH_ANNOTATIONS_PATH not set; "
-                    "triton.cudagraph_kernel_annotations NOT applied "
-                    "(prefix=%r).", compile_prefix)
+            vllm_config.compilation_config.inductor_compile_config[
+                "triton.cudagraph_kernel_annotations"
+            ] = True
+            logger.info(
+                "cuda_graph_markers[wrapper]: torch.compile enabled "
+                "(mode=%s); set compilation_config.inductor_compile_config"
+                "['triton.cudagraph_kernel_annotations']=True "
+                "(prefix=%r, is_encoder=%s)",
+                mode.name, compile_prefix, is_encoder)
         else:
             logger.info(
-                "cuda_graph_markers[wrapper]: backend=%r is not 'inductor'; "
-                "FQN annotation compile option NOT applied (prefix=%r).",
-                backend, compile_prefix)
+                "cuda_graph_markers[wrapper]: "
+                "VLLM_CUDA_GRAPH_ANNOTATIONS_PATH not set; FQN annotation "
+                "compile option NOT applied (prefix=%r).", compile_prefix)
+
+        backend = vllm_config.compilation_config.init_backend(
+            vllm_config, prefix=compile_prefix, is_encoder=is_encoder
+        )
+        options: dict[str, Any] = {}
+
+        if isinstance(backend, str) and backend == "inductor":
+            # STOCK_TORCH_COMPILE: torch.compile receives the inductor config via
+            # the `options` kwarg. The flag we set above is already inside.
+            options = dict(vllm_config.compilation_config.inductor_compile_config)
+            logger.info(
+                "cuda_graph_markers[wrapper]: string 'inductor' backend; "
+                "passing inductor_compile_config via options "
+                "(triton.cudagraph_kernel_annotations=%r)",
+                options.get("triton.cudagraph_kernel_annotations"))
+        else:
+            # VllmBackend (VLLM_COMPILE) or other compile-mode backend: nothing
+            # to pass via options here; VllmBackend deepcopied
+            # compilation_config.inductor_compile_config (which already contains
+            # our flag) during its own __init__ inside init_backend() above.
+            logger.info(
+                "cuda_graph_markers[wrapper]: backend=%s; FQN flag propagated "
+                "via compilation_config.inductor_compile_config (prefix=%r)",
+                type(backend).__name__ if not isinstance(backend, str)
+                else repr(backend),
+                compile_prefix)
 
         self.first_compile = True
         self.evaluate_guards = (
