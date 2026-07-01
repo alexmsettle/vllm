@@ -650,12 +650,22 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp
         return bs, bs
 
-    group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
-    ]
+    if dcp != 1 or pcp != 1:
+        # For hybrid models, attention groups are sharded across DCP/PCP ranks
+        # while mamba/recurrent groups are replicated on every rank. Compute
+        # the scheduler block size as the LCM of the scaled attention block
+        # sizes and the unscaled mamba block sizes.
+        effective_block_sizes = [
+            g.kv_cache_spec.block_size * dcp * pcp
+            if not isinstance(g.kv_cache_spec, MambaSpec)
+            else g.kv_cache_spec.block_size
+            for g in groups
+        ]
+        scheduler_block_size = math.lcm(*effective_block_sizes)
+        # Finer hash-block sizing is not supported when DCP/PCP > 1.
+        return scheduler_block_size, scheduler_block_size
+
+    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
