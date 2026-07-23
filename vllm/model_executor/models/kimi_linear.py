@@ -584,6 +584,21 @@ class KimiLinearForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        """Allocate the persistent PP receive buffers used by non-first ranks."""
+        shape = (batch_size, self.config.hidden_size)
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(shape, dtype=dtype, device=device),
+                "residual": torch.zeros(shape, dtype=dtype, device=device),
+            }
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
